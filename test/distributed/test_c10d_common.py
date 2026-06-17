@@ -205,6 +205,141 @@ class TimeoutTest(TestCase):
             threads = []
 
 
+class BackendEntryPointTest(TestCase):
+    def setUp(self):
+        super().setUp()
+        self._plugins = dist.Backend._plugins.copy()
+        self._backend_list = dist.Backend.backend_list.copy()
+        self._backend_capability = copy.deepcopy(dist.Backend.backend_capability)
+        self._backend_type_map = dist.Backend.backend_type_map.copy()
+        self._default_device_backend_map = (
+            dist.Backend.default_device_backend_map.copy()
+        )
+        self._custom_backend_attrs = {
+            "ENTRYPOINT_TEST": hasattr(dist.Backend, "ENTRYPOINT_TEST"),
+        }
+
+    def tearDown(self):
+        dist.Backend._plugins = self._plugins
+        dist.Backend.backend_list = self._backend_list
+        dist.Backend.backend_capability = self._backend_capability
+        dist.Backend.backend_type_map = self._backend_type_map
+        dist.Backend.default_device_backend_map = self._default_device_backend_map
+        for attr, existed in self._custom_backend_attrs.items():
+            if not existed and hasattr(dist.Backend, attr):
+                delattr(dist.Backend, attr)
+        super().tearDown()
+
+    def test_backend_entrypoint_loads_on_availability_check(self):
+        load_count = 0
+
+        def create_backend(store, rank, world_size, timeout):
+            raise AssertionError("backend factory should not run in this test")
+
+        class EntryPoint:
+            name = "entrypoint_test"
+
+            def load(self):
+                nonlocal load_count
+                load_count += 1
+
+                def register():
+                    dist.Backend.register_backend(
+                        "entrypoint_test",
+                        create_backend,
+                        devices=["cpu"],
+                    )
+
+                return register
+
+        with unittest.mock.patch(
+            "importlib.metadata.entry_points", return_value=[EntryPoint()]
+        ):
+            self.assertTrue(dist.is_backend_available("entrypoint_test"))
+
+        self.assertEqual(load_count, 1)
+        self.assertIn("ENTRYPOINT_TEST", dist.Backend._plugins)
+        backend_config = dist.BackendConfig("entrypoint_test")
+        self.assertEqual(str(backend_config), "cpu:entrypoint_test")
+        self.assertIs(
+            dist.Backend._plugins["ENTRYPOINT_TEST"].creator_fn, create_backend
+        )
+
+    def test_backend_entrypoint_loads_for_backend_config(self):
+        load_count = 0
+
+        def create_backend(store, rank, world_size, timeout):
+            raise AssertionError("backend factory should not run in this test")
+
+        class EntryPoint:
+            name = "entrypoint_test"
+
+            def load(self):
+                nonlocal load_count
+                load_count += 1
+
+                def register():
+                    dist.Backend.register_backend(
+                        "entrypoint_test",
+                        create_backend,
+                        devices=["cpu"],
+                    )
+
+                return register
+
+        with unittest.mock.patch(
+            "importlib.metadata.entry_points", return_value=[EntryPoint()]
+        ):
+            backend_config = dist.BackendConfig("entrypoint_test")
+
+        self.assertEqual(load_count, 1)
+        self.assertEqual(str(backend_config), "cpu:entrypoint_test")
+        self.assertIs(
+            dist.Backend._plugins["ENTRYPOINT_TEST"].creator_fn, create_backend
+        )
+
+    def test_builtin_backend_registers_without_entrypoint(self):
+        # Simulate an environment where torch's distribution metadata (and thus
+        # its entry points) is not discoverable, e.g. when torch is not
+        # pip-installed. Builtin backends must still register via the fallback.
+        dist.Backend._plugins.pop("GLOO", None)
+
+        with unittest.mock.patch(
+            "importlib.metadata.entry_points", return_value=[]
+        ):
+            dist.Backend._ensure_backend_registered("gloo")
+
+        self.assertIn("GLOO", dist.Backend._plugins)
+        self.assertIs(
+            dist.Backend._plugins["GLOO"].creator_fn,
+            c10d._create_gloo_process_group,
+        )
+
+    def test_backend_config_device_form_scans_once_per_backend(self):
+        # The "device:backend" form registers each backend in the per-pair loop,
+        # so it must not also scan entry points for the whole comma-separated
+        # string (which can never match a backend name).
+        dist.Backend._plugins.pop("GLOO", None)
+        dist.Backend._plugins.pop("NCCL", None)
+
+        scanned_groups = []
+
+        def fake_entry_points(group):
+            scanned_groups.append(group)
+            return []
+
+        with unittest.mock.patch(
+            "importlib.metadata.entry_points", side_effect=fake_entry_points
+        ):
+            backend_config = dist.BackendConfig("cpu:gloo,cuda:nccl")
+
+        # One scan for gloo and one for nccl -- not a third for the raw string.
+        self.assertEqual(len(scanned_groups), 2)
+        self.assertIn("GLOO", dist.Backend._plugins)
+        self.assertIn("NCCL", dist.Backend._plugins)
+        self.assertEqual(str(backend_config), "cpu:gloo,cuda:nccl")
+
+
 class Net(nn.Module):
     def __init__(self) -> None:
         super().__init__()
@@ -1840,6 +1975,9 @@ class PythonProcessGroupExtensionTest(MultiProcessTestCase):
         dist.Backend.register_backend(
             "dummy", PythonProcessGroupExtensionTest.create_dummy
         )
+        dummy_backend_config = (
+            f"cpu:dummy,{device_type}:dummy" if device_type != "cpu" else "cpu:dummy"
+        )
 
         # Ensure backend config can be created with the following arguments
         backend_config_strings_and_expected_values = [
@@ -1847,9 +1985,9 @@ class PythonProcessGroupExtensionTest(MultiProcessTestCase):
             (dist.Backend.NCCL, "cuda:nccl"),
             (dist.Backend.MPI, "cpu:mpi,cuda:mpi"),
             (dist.Backend.UCC, "cpu:ucc,cuda:ucc"),
-            (dist.Backend.DUMMY, "cpu:dummy,cuda:dummy"),
-            ("DUMMY", "cpu:dummy,cuda:dummy"),
-            ("dummy", "cpu:dummy,cuda:dummy"),
+            (dist.Backend.DUMMY, dummy_backend_config),
+            ("DUMMY", dummy_backend_config),
+            ("dummy", dummy_backend_config),
             ("cpu:dummy,cuda:dummy", "cpu:dummy,cuda:dummy"),
             ("cpu:dummy,cuda:nccl", "cpu:dummy,cuda:nccl"),
             ("cpu:gloo,cuda:dummy", "cpu:gloo,cuda:dummy"),
@@ -1859,9 +1997,9 @@ class PythonProcessGroupExtensionTest(MultiProcessTestCase):
         if TEST_XPU:
             # Override backend_config_strings_and_expected_values for Intel GPU.
             backend_config_strings_and_expected_values[4:10] = [
-                (dist.Backend.DUMMY, "cpu:dummy,cuda:dummy,xpu:dummy"),
-                ("DUMMY", "cpu:dummy,cuda:dummy,xpu:dummy"),
-                ("dummy", "cpu:dummy,cuda:dummy,xpu:dummy"),
+                (dist.Backend.DUMMY, dummy_backend_config),
+                ("DUMMY", dummy_backend_config),
+                ("dummy", dummy_backend_config),
                 ("cpu:dummy,xpu:dummy", "cpu:dummy,xpu:dummy"),
                 ("cpu:dummy,xpu:xccl", "cpu:dummy,xpu:xccl"),
                 ("cpu:gloo,xpu:dummy", "cpu:gloo,xpu:dummy"),
