@@ -974,6 +974,98 @@ class ComboKernelTests(TestCase):
         # Very-large reductions split out instead of co-fused: 5 kernels (4 = the regression).
         self.assertEqual(torch._inductor.metrics.generated_kernel_count, 5)
 
+    @requires_gpu_and_triton
+    @torch._inductor.config.patch(
+        {
+            "combo_kernel_per_subkernel_blocks": True,
+        }
+    )
+    def test_combo_kernel_dynamic_scale_rblock(self):
+        # A combo kernel with per-subkernel blocks carries size_hints=None at the
+        # autotuner level (per-subkernel hints live in combo_grid_meta), so
+        # _dynamic_scale_rblock used to skip it entirely. With this change a combo
+        # reduction participates in the same occupancy-driven R0_BLOCK scaling as a
+        # standalone reduction.
+        #
+        # Whether a given kernel actually trips the occupancy heuristic is hardware
+        # dependent: it compares the compiled register count against
+        # regs_per_multiprocessor // max_threads_per_multi_processor, and
+        # max_threads_per_multi_processor differs across GPUs (2048 on
+        # A100/H100/Blackwell vs 1536 on Ada sm_89). To stay deterministic across
+        # backends, capture the combo-reduction autotuner and drive
+        # _iter_rblock_scale_candidates() with a forced register-bound, single-SM
+        # device profile, so candidate generation exercises the combo plumbing
+        # rather than the runner's actual register usage.
+        def fn(a, b, c, d):
+            r1 = (a * torch.sigmoid(a) + b).sum(dim=1)
+            r2 = (c * torch.sigmoid(c) + d).sum(dim=1)
+            return r1, r2
+
+        inps = [torch.randn(8192, 2560, device=GPU_TYPE) for _ in range(4)]
+        out_eager = fn(*inps)
+
+        from torch._inductor.runtime.triton_heuristics import CachingAutotuner
+
+        autotuners: list[CachingAutotuner] = []
+        orig_init = CachingAutotuner.__init__
+
+        def capture_init(self, *args, **kwargs):
+            orig_init(self, *args, **kwargs)
+            if (getattr(self, "inductor_meta", {}) or {}).get("combo_grid_meta"):
+                autotuners.append(self)
+
+        with (
+            fresh_cache(),  # isolate from cache so a re-run (inherited subclass) recompiles
+            patch.object(CachingAutotuner, "__init__", capture_init),
+        ):
+            torch._dynamo.reset()
+            out_compiled = torch.compile(fn)(*inps)
+
+        torch.testing.assert_close(out_eager, out_compiled, atol=1e-3, rtol=1e-3)
+
+        combo_reductions = [
+            au for au in autotuners if au._combo_has_reduction_subkernel
+        ]
+        self.assertTrue(
+            combo_reductions,
+            "expected a combo reduction kernel with per-subkernel blocks",
+        )
+
+        # _could_rblock_scale gates the production path; combo reductions
+        # (size_hints=None) must now pass it.
+        scalable = [au for au in combo_reductions if au._could_rblock_scale]
+        self.assertTrue(
+            scalable,
+            "_could_rblock_scale should be True for a combo reduction",
+        )
+
+        # Force a register-bound (per-thread register budget rounds to 0) and
+        # occupancy-limited (single SM) profile so both hardware gates open on any
+        # backend; the remaining gates depend only on the chosen Triton config.
+        scaled_candidates = []
+        for au in scalable:
+            forced_props = au.device_props._replace(
+                multi_processor_count=1,
+                max_threads_per_multi_processor=1 << 30,
+            )
+            with patch.object(au, "device_props", forced_props):
+                scaled_candidates.extend(au._iter_rblock_scale_candidates())
+
+        self.assertTrue(
+            scaled_candidates,
+            "_dynamic_scale_rblock should generate a scaled R0_BLOCK candidate "
+            "for the combo reduction",
+        )
+        # Combo reductions emit per-subkernel suffixed blocks (R0_BLOCK_i), not the
+        # bare R0_BLOCK of a standalone reduction.
+        self.assertTrue(
+            any(
+                any(k.startswith("R0_BLOCK_") for k in cfg.kwargs)
+                for cfg in scaled_candidates
+            ),
+            "combo scaled candidate should carry a suffixed R0_BLOCK_i kwarg",
+        )
+
 
 class ComboKernelBenchmarkTests(TestCase):
     check_model_gpu = check_model_gpu
