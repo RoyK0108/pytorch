@@ -2592,12 +2592,28 @@ class BuiltinVariable(BaseBuiltinVariable):
         op = self.fn
 
         if op in [operator.is_, operator.is_not]:
-            is_result = (
-                left.is_tensor()
-                and right.is_tensor()
-                and id(extract_fake_example_value(left.as_proxy().node))
-                == id(extract_fake_example_value(right.as_proxy().node))
-            )
+            tensor_tensor_identity = left.is_tensor() and right.is_tensor()
+            if tensor_tensor_identity:
+                # Guard the exact object identities constant-folded below.
+                for arg in (left, right):
+                    if arg.source is not None:
+                        install_guard(arg.source.make_guard(GuardBuilder.ID_MATCH))
+                    alias_or_copy_guard = arg.as_proxy().node.meta.get(
+                        "_dynamo_unbacked_alias_or_copy_guard"
+                    )
+                    if alias_or_copy_guard is not None:
+                        source, memory_format = alias_or_copy_guard
+                        install_guard(
+                            source.make_guard(
+                                functools.partial(
+                                    GuardBuilder.TENSOR_CONTIGUITY_MATCH,
+                                    memory_format=memory_format,
+                                )
+                            )
+                        )
+            is_result = tensor_tensor_identity and id(
+                extract_fake_example_value(left.as_proxy().node)
+            ) == id(extract_fake_example_value(right.as_proxy().node))
             if op is operator.is_:
                 return VariableTracker.build(tx, is_result)
             else:
